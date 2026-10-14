@@ -1,0 +1,18 @@
+.{
+    .name = .win32_crash_handling,
+    .fingerprint = 0x539ef8878f12e406,
+    .version = "0.0.0",
+    .zig_version = "0.17.0",
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .win32 = .{
+            .url = "git+https://github.com/marlersoft/zigwin32#fb2645891520f3e99931db17a7eba04057e87e89",
+            .hash = "win32-42.0.39-preview-mX5pFc794wMcrMyFgsO1c4csBdowhpiqqwIyN_xjqI5z",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
