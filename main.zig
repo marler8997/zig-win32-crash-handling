@@ -1,10 +1,10 @@
-//! A win32 GUI program that demonstrates how to catch, report and handle every kind of
-//! error/crash. This example logs each one (with a trace if applicable) and shows a
-//! message box. It logs to stderr. If there is no stderr (common for win32 applications)
-//! it will open a log file and assign it to the stderr handle slot in the PEB.
+//! Catches, reports and handles every kind of error/crash in a win32 GUI program. This
+//! example logs each one (with a trace if applicable) and shows a message box. It logs to
+//! stderr. If there is no stderr (common for win32 applications) it will open a log file and
+//! assign it to the stderr handle slot in the PEB.
 //!
-//! The window has a button for each kind of crash, which crashes from inside the window
-//! procedure like a real GUI program would.
+//! This is the file to copy into your project. The demo application lives in app.zig, which
+//! main.zig uses only for `app.name` and `app.init()`.
 
 pub const std_options: std.Options = .{
     // std's segfault handler logs and aborts without a way for us to handle it. Disabling
@@ -85,127 +85,31 @@ pub fn main() void {
     // Only for this thread, other threads that should report an overflow need their own call.
     setStackGuarantee();
 
-    {
-        const class: win32.WNDCLASSEXW = .{
-            .cbSize = @sizeOf(win32.WNDCLASSEXW),
-            .style = .{},
-            .lpfnWndProc = wndProc,
-            .cbClsExtra = 0,
-            .cbWndExtra = 0,
-            .hInstance = win32.GetModuleHandleW(null),
-            .hIcon = null,
-            .hCursor = win32.LoadCursorW(null, win32.IDC_ARROW),
-            .hbrBackground = @ptrFromInt(@as(usize, @intFromEnum(win32.COLOR_BTNFACE)) + 1),
-            .lpszMenuName = null,
-            .lpszClassName = win32.L("CrashDemo"),
-            .hIconSm = null,
-        };
-        if (0 == win32.RegisterClassExW(&class)) win32.panicWin32("RegisterClass", win32.GetLastError());
-    }
+    app.init();
 
-    const kinds = std.enums.values(Crash);
-    var rect: win32.RECT = .{
-        .left = 0,
-        .top = 0,
-        .right = button_width + 2 * margin,
-        .bottom = @intCast(kinds.len * (button_height + margin) + margin),
-    };
-    // WS_CAPTION is BORDER | DLGFRAME.
-    const style: win32.WINDOW_STYLE = .{ .BORDER = 1, .DLGFRAME = 1, .SYSMENU = 1, .VISIBLE = 1 };
-    if (0 == win32.AdjustWindowRect(&rect, style, 0)) win32.panicWin32("AdjustWindowRect", win32.GetLastError());
-    const hwnd = win32.CreateWindowExW(
-        .{},
-        win32.L("CrashDemo"),
-        win32.L("crashdemo"),
-        style,
-        win32.CW_USEDEFAULT,
-        win32.CW_USEDEFAULT,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        null,
-        null,
-        win32.GetModuleHandleW(null),
-        null,
-    ) orelse win32.panicWin32("CreateWindow", win32.GetLastError());
-
-    inline for (comptime std.enums.values(Crash), 0..) |kind, i| {
-        _ = win32.CreateWindowExW(
-            .{},
-            win32.L("BUTTON"),
-            win32.L(comptime kind.label()),
-            .{ .CHILD = 1, .VISIBLE = 1, .TABSTOP = 1 },
-            margin,
-            @intCast(margin + i * (button_height + margin)),
-            button_width,
-            button_height,
-            hwnd,
-            @ptrFromInt(@intFromEnum(kind) + 1),
-            win32.GetModuleHandleW(null),
-            null,
-        ) orelse win32.panicWin32("CreateWindow(BUTTON)", win32.GetLastError());
-    }
-
-    var msg: win32.MSG = undefined;
-    while (win32.GetMessageW(&msg, null, 0, 0) > 0) {
+    // Be wary of changing this loop from the default. It isn't the only code that pumps this
+    // thread's messages: a modal loop deep in the call graph takes over dispatching, such as
+    // MessageBox or the loop Windows runs while the user drags or resizes a window. Anything
+    // added here (filtering, accelerators, idle work, crash handling) is skipped while one of
+    // those runs, so handle it in the window procedure instead.
+    while (true) {
+        var msg: win32.MSG = undefined;
+        const result = win32.GetMessageW(&msg, null, 0, 0);
+        if (result <= 0) {
+            @branchHint(.unlikely);
+            if (result < 0) win32.panicWin32("GetMessage", win32.GetLastError());
+            break; // result == 0 means WM_QUIT
+        }
         _ = win32.TranslateMessage(&msg);
         _ = win32.DispatchMessageW(&msg);
     }
 }
 
-const Crash = enum {
-    panic,
-    bounds,
-    av,
-    trap,
-    stackoverflow,
-    div0,
-    raise,
-    abort,
-    fastfail,
-
-    fn label(comptime kind: Crash) []const u8 {
-        return switch (kind) {
-            .panic => "@panic",
-            .bounds => "Index out of bounds (safety check)",
-            .av => "Access violation",
-            .trap => "Illegal instruction (@trap)",
-            .stackoverflow => "Stack overflow",
-            .div0 => "Integer divide by zero (hardware, like C code)",
-            .raise => "RaiseException with a custom code",
-            .abort => "C abort()",
-            .fastfail => "__fastfail (not reported, by design)",
-        };
-    }
-};
-
-const button_height = 28;
-const button_width = 360;
-const margin = 10;
-
-fn wndProc(hwnd: win32.HWND, msg: u32, wparam: win32.WPARAM, lparam: win32.LPARAM) callconv(.winapi) win32.LRESULT {
-    switch (msg) {
-        win32.WM_COMMAND => {
-            const id: u16 = @truncate(wparam);
-            if (id >= 1 and id <= std.enums.values(Crash).len) {
-                const kind: Crash = @enumFromInt(id - 1);
-                std.log.info("crashing with '{t}' from the window procedure", .{kind});
-                crash(kind);
-            }
-            return 0;
-        },
-        win32.WM_DESTROY => {
-            win32.PostQuitMessage(0);
-            return 0;
-        },
-        else => return win32.DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-/// Creates crashdemo.log next to the exe.
+/// Creates <app.name>.log next to the exe.
 fn createLogFile(exe_path: std.os.windows.UNICODE_STRING) std.os.windows.HANDLE {
     const exe = exe_path.Buffer.?[0 .. exe_path.Length / 2];
     const dir = exe[0 .. std.mem.lastIndexOfScalar(u16, exe, '\\') orelse 0];
-    const name = win32.L("\\crashdemo.log");
+    const name = win32.L("\\" ++ app.name ++ ".log");
     var path_buf: [std.os.windows.PATH_MAX_WIDE:0]u16 = undefined;
     if (dir.len + name.len > path_buf.len) @panic("exe path too long for the log path");
     @memcpy(path_buf[0..dir.len], dir);
@@ -220,7 +124,7 @@ fn createLogFile(exe_path: std.os.windows.UNICODE_STRING) std.os.windows.HANDLE 
         win32.FILE_ATTRIBUTE_NORMAL,
         null,
     );
-    if (handle == win32.INVALID_HANDLE_VALUE) win32.panicWin32("CreateFile(crashdemo.log)", win32.GetLastError());
+    if (handle == win32.INVALID_HANDLE_VALUE) win32.panicWin32("CreateFile(" ++ app.name ++ ".log)", win32.GetLastError());
     return handle;
 }
 
@@ -322,6 +226,12 @@ test "stack_guarantee leaves room to report a stack overflow" {
             result = writeReport(t, info.?);
             win32.ExitThread(0);
         }
+        noinline fn recurse(depth: usize) usize {
+            var buf: [4096]u8 = undefined;
+            buf[depth % buf.len] = @truncate(depth);
+            std.mem.doNotOptimizeAway(&buf);
+            return recurse(depth + 1) + buf[depth % buf.len];
+        }
     };
     const handler = win32.AddVectoredExceptionHandler(1, overflow.handler) orelse
         win32.panicWin32("AddVectoredExceptionHandler", win32.GetLastError());
@@ -361,52 +271,13 @@ fn msgbox(comptime fmt: []const u8, args: anytype) void {
         break :blk buf.len - 1;
     };
     buf[len] = 0;
-    _ = win32.MessageBoxA(null, buf[0..len :0], "crashdemo crash", .{ .ICONHAND = 1 });
-}
-
-fn crash(kind: Crash) void {
-    switch (kind) {
-        .panic => @panic("crashdemo panic"),
-        .bounds => {
-            var array = [_]u8{ 1, 2, 3 };
-            var index: usize = 5;
-            std.mem.doNotOptimizeAway(&index);
-            std.mem.doNotOptimizeAway(array[index]);
-            std.mem.doNotOptimizeAway(&array);
-        },
-        .av => {
-            const p: *volatile u8 = @ptrFromInt(0x10);
-            p.* = 1;
-        },
-        .trap => @trap(),
-        .stackoverflow => std.mem.doNotOptimizeAway(recurse(0)),
-        .div0 => asm volatile (
-            \\xorl %%ecx, %%ecx
-            \\xorl %%edx, %%edx
-            \\movl $1, %%eax
-            \\divl %%ecx
-            ::: .{ .eax = true, .ecx = true, .edx = true }),
-        .raise => win32.RaiseException(0xE0001234, 0, 0, null),
-        .abort => std.c.abort(),
-        // Not reported, by design: only Windows Error Reporting sees a fast fail.
-        .fastfail => asm volatile ("int $0x29"
-            :
-            : [code] "{ecx}" (@as(u32, 7)),
-        ),
-    }
-    std.debug.panic("crash '{t}' returned", .{kind});
-}
-
-noinline fn recurse(depth: usize) usize {
-    var buf: [4096]u8 = undefined;
-    buf[depth % buf.len] = @truncate(depth);
-    std.mem.doNotOptimizeAway(&buf);
-    return recurse(depth + 1) + buf[depth % buf.len];
+    _ = win32.MessageBoxA(null, buf[0..len :0], app.name ++ " crash", .{ .ICONHAND = 1 });
 }
 
 /// Builds with Zig 0.15.2 and 0.17.0; keep the branches for your version.
 const zig_0_17 = builtin.zig_version.order(.{ .major = 0, .minor = 17, .patch = 0 }) != .lt;
 
+const app = @import("app.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const win32 = @import("win32").everything;

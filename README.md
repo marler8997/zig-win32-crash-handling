@@ -8,6 +8,11 @@ box to the user.
 through it, review and remove the comments as you go, and decide how your application should
 handle each case: where it logs, what the user sees, and which cases it needs at all.
 
+`app.zig` is the demo application (the window of crash buttons) and is not meant to be copied.
+`main.zig` uses only `app.name` (for the log file and message box title) and `app.init()`
+(creates the window; `main.zig` then runs the message loop); replace those with your own
+application.
+
 ```
 zig build run
 ```
