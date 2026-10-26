@@ -207,6 +207,34 @@ fn writeReport(t: Terminal, info: *win32.EXCEPTION_POINTERS) error{WriteFailed}!
     try w.flush();
 }
 
+fn writeModule(w: *std.Io.Writer, address: usize) error{WriteFailed}!void {
+    var module: ?win32.HINSTANCE = null;
+    // With FROM_ADDRESS, lpModuleName is any address in the module.
+    if (0 == win32.GetModuleHandleExW(
+        win32.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | win32.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        @ptrFromInt(address),
+        &module,
+    )) return w.print(" (GetModuleHandleExW failed, error={f})", .{win32.GetLastError()});
+    const offset = address - @intFromPtr(module.?);
+    // MAX_PATH, not PATH_MAX_WIDE (64 KiB): this runs on the faulting thread's stack.
+    var path_buf: [win32.MAX_PATH:0]u16 = undefined;
+    const len = win32.GetModuleFileNameW(module, &path_buf, path_buf.len + 1);
+    if (len == 0 or len == path_buf.len + 1) return w.print(" (+0x{x})", .{offset});
+    const path = path_buf[0..len];
+    const name = path[if (std.mem.lastIndexOfScalar(u16, path, '\\')) |i| i + 1 else 0..];
+    try w.print(" ({f}+0x{x})", .{ std.unicode.fmtUtf16Le(name), offset });
+}
+
+fn msgbox(comptime fmt: []const u8, args: anytype) void {
+    var buf: [1024]u8 = undefined;
+    const len = if (std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args)) |text| text.len else |_| blk: {
+        buf[buf.len - 4 ..][0..3].* = "...".*;
+        break :blk buf.len - 1;
+    };
+    buf[len] = 0;
+    _ = win32.MessageBoxA(null, buf[0..len :0], app.name ++ " crash", .{ .ICONHAND = 1 });
+}
+
 test "stack_guarantee leaves room to report a stack overflow" {
     const overflow = struct {
         var report_buf: [1024 * 1024]u8 = undefined;
@@ -244,34 +272,6 @@ test "stack_guarantee leaves room to report a stack overflow" {
     if (win32.WaitForSingleObject(thread, win32.INFINITE) != .NO_ERROR) win32.panicWin32("WaitForSingleObject", win32.GetLastError());
     try overflow.result;
     try std.testing.expect(std.mem.indexOf(u8, overflow.report.buffered(), " in recurse ") != null);
-}
-
-fn writeModule(w: *std.Io.Writer, address: usize) error{WriteFailed}!void {
-    var module: ?win32.HINSTANCE = null;
-    // With FROM_ADDRESS, lpModuleName is any address in the module.
-    if (0 == win32.GetModuleHandleExW(
-        win32.GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | win32.GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        @ptrFromInt(address),
-        &module,
-    )) return w.print(" (GetModuleHandleExW failed, error={f})", .{win32.GetLastError()});
-    const offset = address - @intFromPtr(module.?);
-    // MAX_PATH, not PATH_MAX_WIDE (64 KiB): this runs on the faulting thread's stack.
-    var path_buf: [win32.MAX_PATH:0]u16 = undefined;
-    const len = win32.GetModuleFileNameW(module, &path_buf, path_buf.len + 1);
-    if (len == 0 or len == path_buf.len + 1) return w.print(" (+0x{x})", .{offset});
-    const path = path_buf[0..len];
-    const name = path[if (std.mem.lastIndexOfScalar(u16, path, '\\')) |i| i + 1 else 0..];
-    try w.print(" ({f}+0x{x})", .{ std.unicode.fmtUtf16Le(name), offset });
-}
-
-fn msgbox(comptime fmt: []const u8, args: anytype) void {
-    var buf: [1024]u8 = undefined;
-    const len = if (std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args)) |text| text.len else |_| blk: {
-        buf[buf.len - 4 ..][0..3].* = "...".*;
-        break :blk buf.len - 1;
-    };
-    buf[len] = 0;
-    _ = win32.MessageBoxA(null, buf[0..len :0], app.name ++ " crash", .{ .ICONHAND = 1 });
 }
 
 /// Builds with Zig 0.15.2 and 0.17.0; keep the branches for your version.
