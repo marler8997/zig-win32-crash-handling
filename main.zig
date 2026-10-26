@@ -25,6 +25,19 @@ const global = struct {
     var reporting_exception = false;
 };
 
+/// The stack left after an overflow, for the filter to write the report and show the box.
+/// Without it the filter overflows again and Windows ends the process with no report. The
+/// trace needs almost all of it, to open the PDB: std's Windows file functions put several
+/// 64 KiB path buffers on the stack. Zig can't compute a call's stack requirement, so the
+/// smallest guarantee that still reports was found by trial. It depends on the Zig version and
+/// optimize mode, and on whatever else the filter does:
+///     Zig 0.15.2: 1.15 MiB Debug, 0.75 MiB ReleaseSafe
+///     Zig 0.17.0: 1.6 MiB Debug, 0.7 MiB ReleaseSafe
+/// It comes out of each thread's stack (16 MiB for the main thread, Zig's default for an exe).
+/// Run `zig build test` (in each optimize mode you ship) after changing the Zig version, the
+/// report or this size: the test below overflows a stack and fails if the report no longer fits.
+const stack_guarantee = 2 * 1024 * 1024;
+
 // redirects panics to our handler which is almost the same as std's but ours
 // shows a messagebox after writing the details to stderr.
 pub const panic = std.debug.FullPanic(onPanic);
@@ -69,11 +82,8 @@ pub fn main() void {
     // handler reports it like any other panic, and the handler never returns to the fast fail.
     if (signal(SIGABRT, onAbort) == SIG_ERR) @panic("signal(SIGABRT) failed");
 
-    {
-        // Enough stack left after an overflow for the filter to write the trace and show the box.
-        var stack_guarantee: u32 = 1024 * 1024;
-        if (0 == win32.SetThreadStackGuarantee(&stack_guarantee)) win32.panicWin32("SetThreadStackGuarantee", win32.GetLastError());
-    }
+    // Only for this thread, other threads that should report an overflow need their own call.
+    setStackGuarantee();
 
     {
         const class: win32.WNDCLASSEXW = .{
@@ -214,6 +224,11 @@ fn createLogFile(exe_path: std.os.windows.UNICODE_STRING) std.os.windows.HANDLE 
     return handle;
 }
 
+fn setStackGuarantee() void {
+    var size: u32 = stack_guarantee;
+    if (0 == win32.SetThreadStackGuarantee(&size)) win32.panicWin32("SetThreadStackGuarantee", win32.GetLastError());
+}
+
 fn isUsableHandle(handle: std.os.windows.HANDLE) bool {
     if (@intFromPtr(handle) == 0) return false;
     // A parent that launches with handle inheritance can pass the value of a stderr handle it
@@ -255,29 +270,70 @@ fn unhandledExceptionFilter(maybe_info: ?*win32.EXCEPTION_POINTERS) callconv(.wi
     const code = @intFromEnum(record.ExceptionCode);
     const address = @intFromPtr(record.ExceptionAddress);
 
-    report: {
-        if (global.reporting_exception) break :report;
+    if (!global.reporting_exception) {
         global.reporting_exception = true;
         var buf: [256]u8 = undefined;
         // The lock is recursive, so a panic in the code below can still take it.
         const stderr = if (zig_0_17) std.debug.lockStderr(&buf).terminal() else std.debug.lockStderrWriter(&buf);
         defer if (zig_0_17) std.debug.unlockStderr() else std.debug.unlockStderrWriter();
-        const w = if (zig_0_17) stderr.writer else stderr;
-        w.print("unhandled exception 0x{X:0>8} at 0x{x}", .{ code, address }) catch break :report;
-        // Flushed before anything that could fault again, so the code and address get out.
-        w.flush() catch break :report;
-        writeModule(w, address) catch break :report;
-        w.writeAll("\n") catch break :report;
-        w.flush() catch break :report;
-        const context: *std.os.windows.CONTEXT = @ptrCast(@alignCast(info.ContextRecord.?));
-        if (zig_0_17) {
-            const native = std.debug.cpu_context.fromWindowsContext(context);
-            std.debug.writeCurrentStackTrace(.{ .context = &native }, stderr) catch break :report;
-        } else std.debug.dumpStackTraceFromBase(context, w);
-        w.flush() catch break :report;
+        writeReport(stderr, info) catch {};
     }
     msgbox("unhandled exception 0x{X:0>8} at 0x{x}", .{ code, address });
     return execute_handler;
+}
+
+const Terminal = if (zig_0_17) std.Io.Terminal else *std.Io.Writer;
+
+/// Writes the exception's code, address and module, then the stack trace from where it happened.
+fn writeReport(t: Terminal, info: *win32.EXCEPTION_POINTERS) error{WriteFailed}!void {
+    const w = if (zig_0_17) t.writer else t;
+    const record = info.ExceptionRecord.?;
+    const address = @intFromPtr(record.ExceptionAddress);
+    try w.print("unhandled exception 0x{X:0>8} at 0x{x}", .{ @intFromEnum(record.ExceptionCode), address });
+    // Flushed before anything that could fault again, so the code and address get out.
+    try w.flush();
+    try writeModule(w, address);
+    try w.writeAll("\n");
+    try w.flush();
+    const context: *std.os.windows.CONTEXT = @ptrCast(@alignCast(info.ContextRecord.?));
+    if (zig_0_17) {
+        const native = std.debug.cpu_context.fromWindowsContext(context);
+        try std.debug.writeCurrentStackTrace(.{ .context = &native }, t);
+    } else std.debug.dumpStackTraceFromBase(context, w);
+    try w.flush();
+}
+
+test "stack_guarantee leaves room to report a stack overflow" {
+    const overflow = struct {
+        var report_buf: [1024 * 1024]u8 = undefined;
+        var report: std.Io.Writer = .fixed(&report_buf);
+        var result: error{WriteFailed}!void = undefined;
+
+        fn thread(_: ?*anyopaque) callconv(.winapi) u32 {
+            setStackGuarantee();
+            std.mem.doNotOptimizeAway(recurse(0));
+            return 1;
+        }
+        /// Runs on the overflowed stack like the unhandled exception filter, then ends the
+        /// thread since it can't continue.
+        fn handler(info: ?*win32.EXCEPTION_POINTERS) callconv(.winapi) i32 {
+            if (info.?.ExceptionRecord.?.ExceptionCode != win32.EXCEPTION_STACK_OVERFLOW) return 0;
+            const t: Terminal = if (zig_0_17) .{ .writer = &report, .mode = .no_color } else &report;
+            result = writeReport(t, info.?);
+            win32.ExitThread(0);
+        }
+    };
+    const handler = win32.AddVectoredExceptionHandler(1, overflow.handler) orelse
+        win32.panicWin32("AddVectoredExceptionHandler", win32.GetLastError());
+    defer _ = win32.RemoveVectoredExceptionHandler(handler);
+    // A small stack, so the trace through recurse fits in the report buffer.
+    const thread = win32.CreateThread(null, stack_guarantee + 1024 * 1024, overflow.thread, null, win32.STACK_SIZE_PARAM_IS_A_RESERVATION, null) orelse
+        win32.panicWin32("CreateThread", win32.GetLastError());
+    defer _ = win32.CloseHandle(thread);
+    // If the report doesn't fit in stack_guarantee, the second overflow ends the test process.
+    if (win32.WaitForSingleObject(thread, win32.INFINITE) != .NO_ERROR) win32.panicWin32("WaitForSingleObject", win32.GetLastError());
+    try overflow.result;
+    try std.testing.expect(std.mem.indexOf(u8, overflow.report.buffered(), " in recurse ") != null);
 }
 
 fn writeModule(w: *std.Io.Writer, address: usize) error{WriteFailed}!void {

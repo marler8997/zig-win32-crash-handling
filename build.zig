@@ -29,4 +29,7 @@ pub fn build(b: *std.Build) void {
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
     b.step("run", "Run crashdemo").dependOn(&run.step);
+
+    const tests = b.addTest(.{ .root_module = exe.root_module });
+    b.step("test", "Run the tests").dependOn(&b.addRunArtifact(tests).step);
 }
